@@ -1,0 +1,145 @@
+{
+  "name": "vod2strm",
+  "version": "0.0.13-fork.2",
+  "description": "Generate .strm and NFO files for Movies & Series from the Dispatcharr DB, with cleanup and CSV reports.",
+  "fields": [
+    {
+      "id": "output_root",
+      "label": "Output Root Folder",
+      "type": "string",
+      "default": "/data/STRM",
+      "help": "Where to write STRM/NFO files (e.g., /data/STRM).",
+      "required": true
+    },
+    {
+      "id": "base_url",
+      "label": "Base URL (for .strm)",
+      "type": "string",
+      "default": "http://localhost:9191",
+      "help": "e.g., http://localhost:9191 or http://dispatcharr:9191",
+      "required": true
+    },
+    {
+      "id": "use_direct_urls",
+      "label": "Use Direct URLs",
+      "type": "boolean",
+      "default": false,
+      "help": "Write provider URLs directly instead of Dispatcharr proxy URLs."
+    },
+    {
+      "id": "write_nfos",
+      "label": "Write NFO files",
+      "type": "boolean",
+      "default": true
+    },
+    {
+      "id": "cleanup_mode",
+      "label": "Cleanup",
+      "type": "select",
+      "default": "off",
+      "options": [
+        { "value": "off", "label": "Off" },
+        { "value": "preview", "label": "Preview (report only)" },
+        { "value": "apply", "label": "Apply (delete stale files)" }
+      ]
+    },
+    {
+      "id": "concurrency",
+      "label": "Max Filesystem Concurrency",
+      "type": "number",
+      "default": 4,
+      "help": "Maximum concurrent file operations (adaptive throttling will adjust based on NAS performance). Lower values protect slower storage."
+    },
+    {
+      "id": "adaptive_throttle",
+      "label": "Adaptive Throttling",
+      "type": "boolean",
+      "default": true,
+      "help": "Automatically reduce concurrency when NAS is slow, increase when fast. Protects against I/O overload."
+    },
+    {
+      "id": "auto_run_after_vod_refresh",
+      "label": "Auto-run after VOD Refresh",
+      "type": "boolean",
+      "default": false,
+      "help": "Automatically generate .strm files after Dispatcharr refreshes VOD content from providers. Uses 30-second debounce to batch multiple refreshes."
+    },
+    {
+      "id": "debug_logging",
+      "label": "Robust debug logging",
+      "type": "boolean",
+      "default": false
+    },
+    {
+      "id": "dry_run",
+      "label": "Dry Run (simulate without writing)",
+      "type": "boolean",
+      "default": false,
+      "help": "Simulate generation without creating/modifying files. Useful for testing."
+    },
+    {
+      "id": "name_clean_regex",
+      "label": "Name Cleaning Regex",
+      "type": "string",
+      "default": "",
+      "help": "Optional regex to strip patterns from names (e.g., ^(?:EN|TOP)\\s*-\\s*). Matches are replaced with empty string."
+    },
+    {
+      "id": "filter_movie_ids",
+      "label": "Content Filter: Movie IDs",
+      "type": "string",
+      "default": "",
+      "help": "Comma-separated database IDs to include (e.g., '11730,14359'). Leave empty to generate all."
+    },
+    {
+      "id": "filter_series_ids",
+      "label": "Content Filter: Series IDs",
+      "type": "string",
+      "default": "",
+      "help": "Comma-separated database IDs to include (e.g., '1521,1797,2736'). Leave empty to generate all."
+    },
+    {
+      "id": "multi_provider_mode",
+      "label": "Multi-Provider Mode",
+      "type": "boolean",
+      "default": false,
+      "help": "Generate STRM files for all providers. When disabled, only generates for the highest priority provider."
+    },
+    {
+      "id": "jellyfin_notify",
+      "label": "Notify Jellyfin After Generation",
+      "type": "boolean",
+      "default": false,
+      "help": "Trigger a targeted Jellyfin library rescan after .strm files are created or updated. Only fires when files are actually written (not on dry runs or cached skips)."
+    },
+    {
+      "id": "jellyfin_url",
+      "label": "Jellyfin URL",
+      "type": "string",
+      "default": "",
+      "help": "Jellyfin server base URL (e.g. http://jellyfin:8096). Note: Dispatcharr runs behind gluetun VPN - Docker container names may not resolve. Use the container IP if needed (find it with: docker inspect jellyfin)."
+    },
+    {
+      "id": "jellyfin_api_key",
+      "label": "Jellyfin API Key",
+      "type": "string",
+      "default": "",
+      "help": "API key for Jellyfin authentication. Generate one in Jellyfin Dashboard > API Keys."
+    },
+    {
+      "id": "jellyfin_library_root",
+      "label": "Jellyfin Library Root",
+      "type": "string",
+      "default": "",
+      "help": "Path as Jellyfin sees the STRM output (e.g. /media/strm). Remaps Output Root to this path when notifying Jellyfin. Leave blank if both containers mount the same path."
+    }
+  ],
+  "actions": [
+    { "id": "db_stats", "label": "Database Statistics" },
+    { "id": "stats", "label": "Stats (CSV)" },
+    { "id": "generate_movies", "label": "Generate Movies" },
+    { "id": "generate_series", "label": "Generate Series" },
+    { "id": "generate_all", "label": "Generate All" },
+    { "id": "db_cleanup", "label": "Delete ALL Episodes" }
+  ]
+}

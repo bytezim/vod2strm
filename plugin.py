@@ -25,9 +25,15 @@ Spec:
 
 from __future__ import annotations
 
-# Ensure plugin directory is in sys.path so Celery workers can import this module
+# Ensure the canonical plugin import path is available to Celery workers.
+# Dispatcharr commonly exposes `/data/plugins` on `sys.path`, which supports
+# `import vod2strm`. Some installations also expose a namespace package named
+# `plugins`, but that is not guaranteed, so we only rely on the `vod2strm`
+# package path here.
 import sys
+from importlib.util import find_spec
 from pathlib import Path
+
 _plugin_parent = Path(__file__).parent.parent
 if str(_plugin_parent) not in sys.path:
     sys.path.insert(0, str(_plugin_parent))
@@ -88,6 +94,83 @@ except Exception:  # pragma: no cover
     celery_app = None  # type: ignore
     shared_task = None  # type: ignore
 
+
+def _possible_task_modules() -> tuple[str, ...]:
+    """
+    Return all module names Celery may need to import for this plugin.
+
+    Dispatcharr plugin packages can be imported either as `vod2strm` or
+    `plugins.vod2strm`, depending on which process is loading them. We always
+    register the canonical `vod2strm` path and only include the `plugins.*`
+    namespace when that package is actually importable in the current process.
+    """
+    candidates = [
+        __name__,
+        "vod2strm",
+        "vod2strm.plugin",
+    ]
+    try:
+        if find_spec("plugins") is not None:
+            candidates.extend([
+                "plugins.vod2strm",
+                "plugins.vod2strm.plugin",
+            ])
+    except Exception:
+        # Keep Celery imports conservative if the namespace package probe fails.
+        pass
+    # Preserve order while removing duplicates/empty strings.
+    return tuple(dict.fromkeys(name for name in candidates if name))
+
+
+def _configure_celery_imports() -> None:
+    """
+    Teach Celery about this plugin regardless of which import path Dispatcharr uses.
+    """
+    if not celery_app:
+        return
+
+    try:
+        existing = celery_app.conf.imports or ()
+        if isinstance(existing, str):
+            existing = (existing,)
+        merged = tuple(dict.fromkeys([*existing, *_possible_task_modules()]))
+        celery_app.conf.imports = merged
+    except Exception as exc:
+        LOGGER.debug("Unable to extend Celery imports for vod2strm: %s", exc)
+
+
+def _alias_plugin_modules() -> None:
+    """
+    Expose this module under all known plugin import paths.
+    """
+    module = sys.modules.get(__name__)
+    if module is None:
+        return
+
+    for alias in ("vod2strm.plugin", "plugins.vod2strm.plugin"):
+        sys.modules.setdefault(alias, module)
+
+
+def _register_task_with_current_app(task_obj) -> None:
+    """
+    Make sure dynamically loaded plugin tasks are attached to the active Celery app.
+
+    Dispatcharr can import plugins after the Celery worker has already initialized.
+    In that case, relying on autodiscovery alone may leave the worker without a
+    strategy for this task name even though the module imported successfully.
+    """
+    if not celery_app or task_obj is None:
+        return
+
+    try:
+        task_name = getattr(task_obj, "name", None)
+        if not task_name:
+            return
+        if task_name not in celery_app.tasks:
+            celery_app.tasks.register(task_obj)
+    except Exception as exc:
+        LOGGER.debug("Unable to register Celery task %s: %s", getattr(task_obj, "name", task_obj), exc)
+
 # -------------------- Constants / Defaults --------------------
 
 DEFAULT_BASE_URL = "http://localhost:9191"
@@ -109,10 +192,15 @@ if not LOGGER.handlers:
     sh.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
     LOGGER.addHandler(sh)
 
+_alias_plugin_modules()
+_configure_celery_imports()
+
 _FILE_LOGGER_CONFIGURED = False
 _LOG_LOCK = threading.Lock()
 _MANIFEST_LOCK = threading.Lock()  # Protects manifest dict from concurrent modification
 _SIGNALS_REGISTERED = False  # Track if signals have been registered (lazy init)
+_BACKGROUND_JOBS_LOCK = threading.Lock()
+_BACKGROUND_JOBS: dict[str, threading.Thread] = {}
 
 
 # -------------------- Query Helpers --------------------
@@ -1365,6 +1453,22 @@ def _run_job_sync(
     LOGGER.info("RUN END mode=%s -> report=%s", mode, report_path)
 
 
+def _run_job_background(job_key: str, args: dict[str, Any]) -> None:
+    """
+    Run a plugin job off the request thread and keep job bookkeeping accurate.
+    """
+    try:
+        _run_job_sync(**args)
+    except Exception:
+        LOGGER.exception("Background job %s failed", job_key)
+    finally:
+        with _BACKGROUND_JOBS_LOCK:
+            current = _BACKGROUND_JOBS.get(job_key)
+            if current is threading.current_thread():
+                _BACKGROUND_JOBS.pop(job_key, None)
+        LOGGER.info("Background job %s finished", job_key)
+
+
 def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None, use_direct_urls: bool = False, multi_provider_mode: bool = False) -> None:
     LOGGER.info("Scanning movies... (dry_run=%s, adaptive=%s, regex=%s, direct_urls=%s, multi_provider=%s)", 
                 dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
@@ -2116,7 +2220,7 @@ class Plugin:
             "label": "Name Cleaning Regex",
             "type": "string",
             "default": "",
-            "help": "Optional regex to strip patterns from names (e.g., ^(?:EN|TOP)\s*-\s*). Matches are replaced with empty string.",
+            "help": r"Optional regex to strip patterns from names (e.g., ^(?:EN|TOP)\s*-\s*). Matches are replaced with empty string.",
         },
         {
             "id": "filter_movie_ids",
@@ -2181,7 +2285,7 @@ class Plugin:
     def run(self, action_id, params, context):
         """
         Dispatcharr calls this when a button is clicked.
-        We enqueue a background job (Celery if available, else a thread).
+        We return quickly and do heavy work on a background thread.
 
         Args:
             action_id: The action being run (e.g., "generate_movies")
@@ -2233,24 +2337,31 @@ class Plugin:
                 return {"status": "error", "message": f"Failed to delete episodes: {e}"}
 
         if action == "stats":
-            self._enqueue("stats", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
-            return {"status": "ok", "message": "Stats job queued. See CSVs in /data/plugins/vod2strm/reports/."}
+            started = self._enqueue("stats", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
+            message = "Stats job started in background. See CSVs in /data/plugins/vod2strm/reports/." if started else "Stats job is already running for this output root."
+            return {"status": "ok", "message": message}
         if action == "generate_movies":
-            self._enqueue("movies", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
-            msg = "Generate Movies job queued (DRY RUN - no files will be written)." if dry_run else "Generate Movies job queued."
+            started = self._enqueue("movies", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
+            msg = "Generate Movies job started (DRY RUN - no files will be written)." if dry_run else "Generate Movies job started."
+            if not started:
+                msg = "Generate Movies job is already running for this output root."
             return {"status": "ok", "message": msg}
         if action == "generate_series":
-            self._enqueue("series", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
-            msg = "Generate Series job queued (DRY RUN - no files will be written)." if dry_run else "Generate Series job queued."
+            started = self._enqueue("series", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
+            msg = "Generate Series job started (DRY RUN - no files will be written)." if dry_run else "Generate Series job started."
+            if not started:
+                msg = "Generate Series job is already running for this output root."
             return {"status": "ok", "message": msg}
         if action == "generate_all":
-            self._enqueue("all", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
-            msg = "Generate All job queued (DRY RUN - no files will be written)." if dry_run else "Generate All job queued."
+            started = self._enqueue("all", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
+            msg = "Generate All job started (DRY RUN - no files will be written)." if dry_run else "Generate All job started."
+            if not started:
+                msg = "Generate All job is already running for this output root."
             return {"status": "ok", "message": msg}
 
         return {"status": "error", "message": f"Unknown action: {action}"}
 
-    def _enqueue(self, mode, output_root: Path, base_url: str, write_nfos: bool, cleanup_mode: str, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None, use_direct_urls: bool = False, multi_provider_mode: bool = False):
+    def _enqueue(self, mode, output_root: Path, base_url: str, write_nfos: bool, cleanup_mode: str, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None, use_direct_urls: bool = False, multi_provider_mode: bool = False) -> bool:
         args = {
             "mode": mode,
             "output_root": str(output_root),
@@ -2266,33 +2377,31 @@ class Plugin:
             "multi_provider_mode": multi_provider_mode,
         }
 
-        # REASONING: Threading fallback removed
-        # This plugin runs inside Dispatcharr, which requires Celery to function.
-        # If Celery is unavailable, Dispatcharr itself won't be running, so there's
-        # no scenario where this plugin is active but Celery is down.
-        # Removing the threading fallback simplifies the code and removes unnecessary
-        # complexity for a scenario that cannot occur in production.
+        job_key = f"{mode}:{output_root}"
+        with _BACKGROUND_JOBS_LOCK:
+            existing = _BACKGROUND_JOBS.get(job_key)
+            if existing and existing.is_alive():
+                LOGGER.info("Background job already running for %s", job_key)
+                return False
 
-        if not celery_app:
-            LOGGER.error("Celery not available - cannot enqueue background task. This should not happen if Dispatcharr is running correctly.")
-            return
+            worker = threading.Thread(
+                target=_run_job_background,
+                args=(job_key, args),
+                name=f"vod2strm-{mode}",
+                daemon=True,
+            )
+            _BACKGROUND_JOBS[job_key] = worker
+            worker.start()
 
-        # Try to call the task - use send_task as fallback if direct call fails
-        task_name = "vod2strm.plugin.run_job"
-        try:
-            if celery_run_job is not None:
-                # Direct call if function is available
-                celery_run_job.delay(args)
-                LOGGER.info("Enqueued Celery task run_job(mode=%s, dry_run=%s, adaptive=%s, regex=%s, direct_urls=%s)", mode, dry_run, adaptive_throttle, clean_regex, use_direct_urls)
-            else:
-                # Fallback: send by name (works even if module not imported by worker yet)
-                celery_app.send_task(task_name, args=[args])
-                LOGGER.info("Enqueued Celery task %s by name (mode=%s, dry_run=%s)", task_name, mode, dry_run)
-        except Exception as e:
-            LOGGER.warning("Failed to enqueue task directly, trying send_task by name: %s", e)
-            # Fallback: send by name
-            celery_app.send_task(task_name, args=[args])
-            LOGGER.info("Enqueued Celery task %s by name (fallback, mode=%s)", task_name, mode)
+        LOGGER.info(
+            "Started background plugin job mode=%s dry_run=%s adaptive=%s regex=%s direct_urls=%s",
+            mode,
+            dry_run,
+            adaptive_throttle,
+            clean_regex,
+            use_direct_urls,
+        )
+        return True
 
 
 # -------------------- Celery task registration --------------------
@@ -2317,6 +2426,17 @@ if shared_task is not None:
         except Exception as e:
             LOGGER.error("Celery task run_job failed: %s", e, exc_info=True)
             raise
+
+
+    @shared_task(name="plugins.vod2strm.plugin.run_job")
+    def celery_run_job_dispatcharr(args: dict):
+        """
+        Alias for Dispatcharr installations that import plugins under `plugins.*`.
+        """
+        return celery_run_job(args)
+
+    _register_task_with_current_app(celery_run_job)
+    _register_task_with_current_app(celery_run_job_dispatcharr)
 
 
     @shared_task(name="vod2strm.plugin.generate_all")
@@ -2356,6 +2476,16 @@ if shared_task is not None:
         except Exception as e:
             LOGGER.error("Celery scheduled task generate_all failed: %s", e, exc_info=True)
             raise
+
+    @shared_task(name="plugins.vod2strm.plugin.generate_all")
+    def celery_generate_all_dispatcharr():
+        """
+        Alias for Dispatcharr installations that import plugins under `plugins.*`.
+        """
+        return celery_generate_all()
+
+    _register_task_with_current_app(celery_generate_all)
+    _register_task_with_current_app(celery_generate_all_dispatcharr)
 
     # Tasks are auto-discovered by Celery when the module is imported
     # Dispatcharr's plugin system should handle module loading
