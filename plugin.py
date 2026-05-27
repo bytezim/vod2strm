@@ -6,8 +6,8 @@ Spec:
 - ORM (in-process) with Celery background tasks (non-blocking UI).
 - Buttons: Stats, Generate Movies, Generate Series, Generate All.
 - STRM generation:
-  * Movies -> <root>/Movies/{Category}/{Name} ({Year}) {tmdb-ID}/{Name} ({Year}) {tmdb-ID}.strm
-  * Series -> <root>/TV/{Category}/{SeriesName (Year)} {tmdb-ID}/Season {SS}/S{SS}E{EE} - {Title}.strm
+  * Movies -> <root>/Movies/{Name} ({Year}) {tmdb-ID}/{Name} ({Year}) {tmdb-ID}.strm
+  * Series -> <root>/TV/{SeriesName (Year)} {tmdb-ID}/Season {SS}/S{SS}E{EE} - {Title}.strm
   * Season 00 labeled "Season 00 (Specials)".
   * {tmdb-ID} suffix omitted when no valid TMDB ID available.
   * .strm contents use {base_url}/proxy/vod/(movie|episode)/{uuid}?stream_id={stream_id}
@@ -17,8 +17,7 @@ Spec:
   * TV shows: tvshow.nfo — title, plot, year, genres, director, cast, ratings, IDs, thumb
   * Seasons: season.nfo per season folder
   * Episodes: SxxExx.nfo — title, showtitle, season/episode, runtime, plot, ratings, IDs, streamdetails
-- Category directories sourced from M3UMovieRelation / M3USeriesRelation category FK.
-- Cleanup (preview/apply) of stale files/folders (auto-prunes empty category dirs).
+- Cleanup (preview/apply) of stale files/folders.
 - CSV reports -> /data/plugins/vod2strm/reports/
 - Robust debug logging -> /data/plugins/vod2strm/logs/
 """
@@ -318,8 +317,7 @@ def _get_episode_stream_id(episode: Episode) -> str | None:
     """
     try:
         # Get highest priority active relation
-        # NOTE: M3UEpisodeRelation has no category_id field (unlike M3UMovieRelation/M3USeriesRelation)
-        # Episodes inherit category from parent series, so we don't filter by category here
+        # M3UEpisodeRelation has no category_id field, so there is no category filter here.
         relation = M3UEpisodeRelation.objects.filter(
             episode_id=episode.id,
             m3u_account__is_active=True,
@@ -1060,13 +1058,13 @@ def _compare_tree_quick(series_root: Path, expected_count: int, want_nfos: bool)
 
 # -------------------- Generators --------------------
 
-def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], relation: M3UMovieRelation, dry_run: bool = False, throttle: AdaptiveThrottle | None = None, clean_regex: str | None = None, use_direct_urls: bool = False, provider_suffix: Optional[str] = None, category_name: str = "Uncategorised") -> None:
+def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], relation: M3UMovieRelation, dry_run: bool = False, throttle: AdaptiveThrottle | None = None, clean_regex: str | None = None, use_direct_urls: bool = False, provider_suffix: Optional[str] = None) -> None:
     raw_name = movie.name or ""
     movie_name = _clean_name(raw_name, clean_regex)
     movie_year = getattr(movie, "year", None)
     movie_tmdb = getattr(movie, "tmdb_id", None)
 
-    m_folder = root / "Movies" / category_name / _movie_folder_name(movie_name, movie_year, tmdb_id=movie_tmdb)
+    m_folder = root / "Movies" / _movie_folder_name(movie_name, movie_year, tmdb_id=movie_tmdb)
     
     # Build .strm filename - add provider suffix for multi-provider mode
     base_filename = _movie_folder_name(movie_name, movie_year, tmdb_id=movie_tmdb)
@@ -1110,7 +1108,7 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
             report_rows.append(["movie_nfo", "", "", raw_name, movie_year or "", str(movie.uuid), "", str(nfo_path), "written" if wrote_nfo else "skipped", nfo_reason])
 
 
-def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], relation: M3UEpisodeRelation, dry_run: bool = False, throttle: AdaptiveThrottle | None = None, written_seasons: set | None = None, written_tvshows: set | None = None, clean_regex: str | None = None, use_direct_urls: bool = False, provider_suffix: Optional[str] = None, series_category: str = "Uncategorised") -> None:
+def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], relation: M3UEpisodeRelation, dry_run: bool = False, throttle: AdaptiveThrottle | None = None, written_seasons: set | None = None, written_tvshows: set | None = None, clean_regex: str | None = None, use_direct_urls: bool = False, provider_suffix: Optional[str] = None) -> None:
     # Workaround for Dispatcharr issue #556: Validate episode still exists before writing
     # Episodes can disappear mid-generation due to sync conflicts
     try:
@@ -1132,7 +1130,7 @@ def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, 
         LOGGER.debug("Episode validation check failed: %s. Continuing anyway.", validation_error)
 
     series_tmdb = getattr(series, "tmdb_id", None)
-    s_folder = root / "TV" / series_category / _series_folder_name(_clean_name(series.name or "", clean_regex), getattr(series, "year", None), tmdb_id=series_tmdb)
+    s_folder = root / "TV" / _series_folder_name(_clean_name(series.name or "", clean_regex), getattr(series, "year", None), tmdb_id=series_tmdb)
     season_number = getattr(episode, "season_number", 0) or 0
     e_folder = s_folder / _season_folder_name(season_number)
 
@@ -1472,13 +1470,13 @@ def _run_job_background(job_key: str, args: dict[str, Any]) -> None:
 def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None, use_direct_urls: bool = False, multi_provider_mode: bool = False) -> None:
     LOGGER.info("Scanning movies... (dry_run=%s, adaptive=%s, regex=%s, direct_urls=%s, multi_provider=%s)", 
                 dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
-    # Get all movies with active provider relations
-    # Prefetch ALL active relations (not just highest priority) to generate STRM files for all providers
+    # Get all movies with active provider relations.
+    # Prefetch all active relations (not just the highest priority one) to generate STRM files for all providers.
     active_movie_relations = M3UMovieRelation.objects.filter(
         m3u_account__is_active=True,
     ).filter(
         Q(category__isnull=True) | _enabled_category_subquery("m3u_account_id", "category_id")
-    ).select_related('m3u_account', 'category').order_by('-m3u_account__priority', 'id')
+    ).select_related('m3u_account').order_by('-m3u_account__priority', 'id')
 
     qs = _eligible_movie_queryset().prefetch_related(
         Prefetch('m3u_relations', queryset=active_movie_relations, to_attr='active_relations')
@@ -1514,9 +1512,6 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
                         rows.append(["movie", "", "", m.name or "", getattr(m, "year", ""), str(m.uuid), "", "", "skipped", "no_active_relations"])
                     return
                 
-                # Category from highest-priority relation (used for all provider variants)
-                cat_name = _norm_fs_name(relations[0].category.name) if relations[0].category else "Uncategorised"
-
                 # If single provider mode, only use the first (highest priority) relation
                 if not multi_provider_mode:
                     relations = [relations[0]]
@@ -1530,8 +1525,7 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
 
                     _make_movie_strm_and_nfo(
                         m, base_url, root, write_nfo_for_this, rows, lock, manifest,
-                        relation, dry_run, throttle, clean_regex, use_direct_urls, provider_suffix,
-                        category_name=cat_name
+                        relation, dry_run, throttle, clean_regex, use_direct_urls, provider_suffix
                     )
             except Exception as e:
                 LOGGER.warning("Movie id=%s failed: %s", m.id, e)
@@ -1726,13 +1720,12 @@ def _maybe_internal_refresh_series(series: Series) -> bool:
 def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None, use_direct_urls: bool = False, multi_provider_mode: bool = False) -> None:
     LOGGER.info("Scanning series... (dry_run=%s, adaptive=%s, regex=%s, direct_urls=%s, multi_provider=%s)", 
                 dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
-    # Only generate .strm files for series with active provider relations
-    # Prefetch series relations to get category for directory structure
+    # Only generate .strm files for series with active provider relations.
     active_series_relations = M3USeriesRelation.objects.filter(
         m3u_account__is_active=True,
     ).filter(
         Q(category__isnull=True) | _enabled_category_subquery("m3u_account_id", "category_id")
-    ).select_related('m3u_account', 'category').order_by('-m3u_account__priority', 'id')
+    ).select_related('m3u_account').order_by('-m3u_account__priority', 'id')
 
     series_qs = _eligible_series_queryset().annotate(
         episode_count=Count('episodes', distinct=True)
@@ -1755,10 +1748,7 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
 
     for s in series_qs.iterator(chunk_size=200):
         try:
-            # Category from highest-priority series relation
-            s_relations = getattr(s, 'active_relations', [])
-            s_cat_name = _norm_fs_name(s_relations[0].category.name) if s_relations and s_relations[0].category else "Uncategorised"
-            series_folder = root / "TV" / s_cat_name / _series_folder_name(_clean_name(s.name or "", clean_regex), getattr(s, "year", None), tmdb_id=getattr(s, "tmdb_id", None))
+            series_folder = root / "TV" / _series_folder_name(_clean_name(s.name or "", clean_regex), getattr(s, "year", None), tmdb_id=getattr(s, "tmdb_id", None))
             # Use annotated episode_count to avoid N+1 query
             expected = getattr(s, 'episode_count', 0)
 
@@ -1780,12 +1770,11 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
                     rows.append(["series", s.name or "", "", "", getattr(s, "year", ""), str(s.uuid), str(series_folder), "", "skipped", "tree_complete"])
                 continue
 
-            # Generate episodes for the series
-            # If episodes have M3U relations, use those for stream IDs
-            # Otherwise, use series stream URL (provider may not have episode-level streams)
-            # Workaround for Dispatcharr issue #569: Use .distinct() to handle duplicate M3UEpisodeRelation records
-            # Prefetch M3UEpisodeRelation to avoid N+1 queries (one query per episode)
-            # NOTE: Episodes don't have category_id - they inherit from parent series
+            # Generate episodes for the series.
+            # If episodes have M3U relations, use those for stream IDs.
+            # Otherwise, use the series stream URL.
+            # Workaround for Dispatcharr issue #569: use .distinct() to handle duplicate M3UEpisodeRelation records.
+            # Prefetch M3UEpisodeRelation to avoid N+1 queries.
             active_episode_relations = M3UEpisodeRelation.objects.filter(
                 m3u_account__is_active=True,
             ).select_related('m3u_account').order_by('-m3u_account__priority', 'id')
@@ -1855,8 +1844,7 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
                             
                             _make_episode_strm_and_nfo(
                                 s, e, base_url, root, write_nfo_for_this, rows, lock, manifest,
-                                relation, dry_run, throttle, written_seasons, written_tvshows, clean_regex, use_direct_urls, provider_suffix,
-                                series_category=s_cat_name
+                                relation, dry_run, throttle, written_seasons, written_tvshows, clean_regex, use_direct_urls, provider_suffix
                             )
                     except Exception as ep_error:
                         LOGGER.warning("Episode id=%s failed: %s", e.id, ep_error)
